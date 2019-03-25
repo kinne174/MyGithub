@@ -31,6 +31,8 @@ import os
 import matplotlib.pyplot as plt
 import pandas as pd
 
+tf.enable_eager_execution()
+
 tfd = tfp.distributions
 
 class Data:
@@ -40,7 +42,7 @@ class Data:
     def __init__(self):
         pass
 
-    def simulate(self, num_routes=3, num_samples=300, p_vector=(.4, .6), active_mu = (10, 15, 20, 25), active_sigma = (2, 1.5, 1.5, 2), success_probability=0.5, seed=635):
+    def simulate(self, num_positions=3, num_samples=300, p_vector=(.4, .6), active_mu = (10, 15, 20, 25), active_sigma = (2, 1.5, 1.5, 2), success_probability=0.5, seed=635):
         '''
         :param num_routes: number of classes within multinomials
         :param num_samples: number of samples
@@ -58,7 +60,7 @@ class Data:
         #set seed
         np.random.seed(seed)
 
-        num_positions = len(p_vector)
+        num_routes = len(p_vector)
         num_active = len(active_mu)
 
         #routes is a matrix of dimension num_samples by (num_positions x num_routes)
@@ -67,7 +69,7 @@ class Data:
             routes[:, list(range(i*num_routes, (i+1)*num_routes))] = np.random.multinomial(1, p_vector, size=num_samples)
 
         for i in range(num_samples):
-            assert sum(routes[i, :]) == num_routes
+            assert sum(routes[i, :]) == num_positions, 'The num routes is {} and the sum is {}'.format(num_routes, sum(routes[i, :]))
 
         #actives is a matrix of dimension num_samples by num_active
         actives = np.empty([num_samples, num_active])
@@ -105,7 +107,7 @@ class RBM:
         self.m = m
 
         #learning rate
-        self.lr = tf.placeholder(tf.float32)
+        self.lr = tf.placeholder(tf.float32) if not tf.executing_eagerly() else tf.constant(1., dtype=tf.float32)
 
         #weight matrix
         self.w = weight([n_active, n_position*n_route], 'W')
@@ -115,12 +117,12 @@ class RBM:
         self.sigma_not = tf.constant([1.]*n_active, dtype=tf.float32)
         self.eta = tf.constant([1.]*n_active, dtype=tf.float32)
         self.nu = tf.constant([1.]*n_active, dtype=tf.float32)
-        self.alpha = tf.constant([1.]*n_route)
+        self.alpha = tf.constant([1.]*n_route, dtype=tf.float32)
 
         #variable parameters
-        self.mu = tf.Variable([0.]*n_active, name='mu')
-        self.sigma = tf.Variable([1.]*n_active, name='sigma')
-        self.theta = tf.Variable(np.full([n_position, n_route], n_route**-1), name='theta')
+        self.mu = tf.Variable([0.]*n_active, name='mu', dtype=tf.float32)
+        self.sigma = tf.Variable([1.]*n_active, name='sigma', dtype=tf.float32)
+        self.theta = tf.Variable(np.full([n_position, n_route], n_route**-1 + 1e-2), name='theta', dtype=tf.float32)
 
 
     '''
@@ -131,62 +133,62 @@ class RBM:
     def postpreddown(self, routes):
 
         #number of samples to generate
-        num_samples = routes.shape[0]
+        num_samples = tf.cast(tf.shape(routes)[0], tf.float32)
 
         #use mean of samples
-        routes_mean = tf.reduce_mean(routes, axis=0)
+        routes_mean = tf.reshape(tf.cast(tf.reduce_mean(routes, axis=0), tf.float32), [-1, 1])
+
+        assert routes_mean.get_shape().as_list() == [self.n_position*self.n_route, 1], 'Routes mean should have {} elements but has {}'.format(self.n_position*self.n_route, routes_mean.get_shape().as_list()[1])
 
         #location and scale vectors according to predictive posterior calculations
-        mean_vec = tf.add(tf.multiply(tf.divide(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.add(tf.square(self.sigma), tf.multiply(num_samples, tf.square(self.sigma_not)))), tf.matmul(self.w, tf.transpose(routes_mean))),
-                          tf.multiply(tf.divide(tf.square(self.sigma), tf.add(tf.square(self.sigma), tf.multiply(num_samples, tf.square(self.sigma_not)))), self.mu_not))
+        mean_vec1 = tf.multiply(tf.divide(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.add(tf.square(self.sigma), tf.multiply(num_samples, tf.square(self.sigma_not)))), tf.reshape(tf.matmul(self.w, routes_mean), [-1])) #have to compress column vectors into arrays otherwise broadcasting gets screwy
+        mean_vec2 = tf.multiply(tf.divide(tf.square(self.sigma), tf.add(tf.square(self.sigma), tf.multiply(num_samples, tf.square(self.sigma_not)))), self.mu_not)
+        mean_vec = tf.add(mean_vec1, mean_vec2)
+
         sigma_vec = tf.sqrt(tf.add(tf.divide(tf.multiply(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.square(self.sigma)), tf.add(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.square(self.sigma))), tf.square(self.sigma)))
 
-        assert mean_vec.shape == self.mu.shape, 'mu shapes for posterior predictive of normal-normal are different'
-        assert sigma_vec.shape == self.sigma.shape, 'sigma shapes for posterior predictive of normal-normal are different'
+        assert mean_vec.get_shape().as_list() == self.mu.get_shape().as_list(), 'mu shapes for posterior predictive of normal-normal are different'
+        assert sigma_vec.get_shape().as_list() == self.sigma.get_shape().as_list(), 'sigma shapes for posterior predictive of normal-normal are different'
 
         #create mulivariate normal distribution assuming independence between observations
         multi_normal = tfd.MultivariateNormalDiag(loc=mean_vec, scale_diag=sigma_vec)
 
         #should be a tensor with dimension number of samples by number of active data points
-        return multi_normal.sample(sample_shape=[num_samples, self.n_active])
+        return multi_normal.sample(sample_shape=tf.cast(num_samples, tf.int32))
 
     def postpredup(self, num_samples):
 
-        #initialize output
-        real_out = tf.zeros(shape=[num_samples, self.n_route*self.n_position])
+        #cast so sample can handle the input
+        num_samples = tf.cast(num_samples, tf.int32)
 
-        for j in range(num_samples):
+        #initialize multinomial distribution drawing one route per position
+        multinomial = tfd.Multinomial(total_count=tf.constant([1.]*self.n_position, dtype=tf.float32), probs=self.theta, validate_args=True)
 
-            #to generate one sample, generate observations for each position route combination
-            temp = tf.zeros(shape=self.theta.shape)
-            for i in range(self.n_position):
-                multinomial = tfd.Multinomial(total_count=1., probs=self.theta[i, :])
-                temp[i, :] = multinomial.sample(sample_shape=1)
-
-            #flatten observations to fit into single row
-            real_out[j, :] = tf.reshape(temp, [-1])
-
-        return real_out
+        #draw samples and reshape to conform to structure I've been using
+        sample = multinomial.sample(num_samples)
+        return tf.reshape(sample, [num_samples, self.n_position*self.n_route])
 
     '''
     Fix gradients to incorporate the difference between the true observations at the beginning and the new ones at the end.
     Similar to how it was done online. Will need to re write this part. No comments for now.
     '''
     def gradientup(self, route_samples):
-        out = tf.zeros(shape=self.w.shape)
-        num_samples = route_samples.shape[0]
+        out = tf.zeros(shape=tf.shape(self.w))
+        num_samples = tf.cast(tf.shape(route_samples)[0], tf.int32)
+        route_samples = tf.cast(tf.convert_to_tensor(route_samples), tf.float32)
+
         for i in range(num_samples):
-            new = tf.matmul(tf.matmul(tf.diag(self.sigma),
-                                      tf.subtract(tf.matmul(self.w, tf.transpose(route_samples[i, :])), self.mu)),
-                            route_samples[i, :])
+            new = tf.matmul(tf.matmul(tf.diag(tf.reciprocal(self.sigma)), tf.subtract(tf.matmul(self.w, tf.reshape(route_samples[i, :], [-1, 1])), tf.reshape(self.mu, [-1, 1]))), tf.reshape(route_samples[i, :], [1, -1]))
             out = tf.add(out, new)
         return out
 
     def gradientdown(self, active_samples):
-        out = tf.zeros(shape=self.w.shape)
-        num_samples = active_samples.shape[0]
+        out = tf.zeros(shape=tf.shape(self.w))
+        num_samples = tf.cast(tf.shape(active_samples)[0], tf.int32)
+        active_samples = tf.cast(tf.convert_to_tensor(active_samples), tf.float32)
+
         for i in range(num_samples):
-            new = tf.matmul(tf.transpose(active_samples[i, :]), tf.log(tf.divide(tf.reshape(self.theta, [-1]), tf.subtract(1, tf.reshape(self.theta, [-1])))))
+            new = tf.matmul(tf.reshape(active_samples[i, :], [-1, 1]), tf.log(tf.divide(tf.reshape(self.theta, [1, -1]), tf.subtract(1, tf.reshape(self.theta, [1, -1])))))
             out = tf.add(out, new)
         return out
 
@@ -198,66 +200,69 @@ class RBM:
     '''
     def CD_k(self, samples):
 
-        assert samples.shape[0] > 0, 'Need atleast one sample'
+        samples = tf.cast(samples, tf.float32)
+
+        assert samples.get_shape().as_list()[0] > 0, 'Need atleast one sample'
+
+        self.flag = True
 
         #alternate between starting from routes and starting from actives
         if self.flag:
             self.flag = not self.flag
 
-            assert samples.shape[1] == self.n_position*self.n_route, 'Number of observations in the route sample is not correct'
+            assert samples.get_shape().as_list()[1] == self.n_position*self.n_route, 'Number of observations in the route sample is not correct'
 
             return self.CD_k_up(samples)
+
         else:
             self.flag = not self.flag
 
-            assert samples.shape[1] == self.n_active, 'Number of observations in the active sample is not correct'
+            assert samples.get_shape().as_list()[1] == self.n_active, 'Number of observations in the active sample is not correct'
 
             return self.CD_k_down(samples)
 
     def CD_k_up(self, route_samples):
 
+        in_samples = route_samples
+
         #given true route samples trade back and forth and produce new route samples at the end
-        num_samples = route_samples.shape[0]
+        num_samples_int = tf.shape(route_samples)[0]
+        num_samples_float = tf.cast(num_samples_int, tf.float32)
+
 
         for _ in range(self.k):
 
             #use the means to compact information
-            routes_mean = tf.reduce_mean(route_samples, axis=0)
+            routes_mean = tf.reshape(tf.reduce_mean(route_samples, axis=0), [-1, 1])
 
             for _ in range(self.m):
 
                 #get the mean vec according to posterior of mu
-                mean_vec = tf.add(tf.multiply(tf.divide(tf.multiply(num_samples, tf.square(self.sigma_not)),
-                                                        tf.add(tf.square(self.sigma),
-                                                               tf.multiply(num_samples, tf.square(self.sigma_not)))),
-                                              tf.matmul(self.w, tf.transpose(routes_mean))),
-                                  tf.multiply(tf.divide(tf.square(self.sigma), tf.add(tf.square(self.sigma),
-                                                                                      tf.multiply(num_samples, tf.square(
-                                                                                          self.sigma_not)))), self.mu_not))
+                mean_vec = tf.add(tf.multiply(tf.divide(tf.multiply(num_samples_float, tf.square(self.sigma_not)), tf.add(tf.square(self.sigma), tf.multiply(num_samples_float, tf.square(self.sigma_not)))), tf.reshape(tf.matmul(self.w, routes_mean), [-1])),
+                                  tf.multiply(tf.divide(tf.square(self.sigma), tf.add(tf.square(self.sigma), tf.multiply(num_samples_float, tf.square(self.sigma_not)))), self.mu_not))
 
                 #get the sigma vec according to the posterior of mu
-                sigma_vec = tf.sqrt(
-                    tf.divide(tf.multiply(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.square(self.sigma)),
-                              tf.add(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.square(self.sigma))))
+                sigma_vec = tf.sqrt(tf.divide(tf.multiply(tf.multiply(num_samples_float, tf.square(self.sigma_not)), tf.square(self.sigma)),
+                                              tf.add(tf.multiply(num_samples_float, tf.square(self.sigma_not)), tf.square(self.sigma))))
 
-                assert mean_vec.shape == self.mu.shape
-                assert sigma_vec.shape == self.sigma.shape
+                assert mean_vec.get_shape().as_list() == self.mu.get_shape().as_list(), 'Mean vector should have same shape as mu in normal-normal'
+                assert sigma_vec.get_shape().as_list() == self.sigma.get_shape().as_list(), 'Scale vector should have same shape as sigma in normal-normal'
 
                 #intialize and draw new mu
                 normal = tfd.MultivariateNormalDiag(loc=mean_vec, scale_diag=sigma_vec)
-                self.mu.assign(normal.sample(sample_shape=self.mu.shape))
+                self.mu.assign(normal.sample())
 
                 #get alpha and beta according to posterior of sigma
                 concentration = tf.add(self.nu, 0.5)
-                rate = tf.divide(tf.add(tf.multiply(2, self.nu), tf.square(tf.subtract(tf.matmul(self.w, tf.transpose(routes_mean)), self.mu))), 2)
+                rate = tf.divide(tf.add(tf.multiply(2, self.nu), tf.square(tf.subtract(tf.reshape(tf.matmul(self.w, routes_mean), [-1]), self.mu))), 2)
 
-                assert concentration.shape == ()
-                assert rate.shape == self.sigma.shape
+                assert concentration.get_shape().as_list() == self.sigma.get_shape().as_list(), 'Alpha of inverse gamma should have as many elements as sigma'
+                assert rate.get_shape().as_list() == self.sigma.get_shape().as_list(), 'Beta of inverse gamma should have as many elements as sigma'
 
                 #draw sigma vector indpendently since I'm assuming independence right now
                 sig_list = []
-                for i in range(self.sigma.shape[0]):
-                    inv_gamma = tfd.InverseGamma(concentration=concentration, rate=rate[i])
+                for i in range(tf.shape(self.sigma)[0]):
+                    inv_gamma = tfd.InverseGamma(concentration=concentration[i], rate=rate[i])
                     sig_list.append(inv_gamma.sample())
                 self.sigma.assign(tf.convert_to_tensor(sig_list, dtype=tf.float32))
 
@@ -265,36 +270,44 @@ class RBM:
             active_samples = self.postpreddown(route_samples)
 
             #work with mean reduction of data
-            actives_mean = tf.reduce_mean(active_samples, axis=0)
+            actives_mean = tf.reshape(tf.reduce_mean(active_samples, axis=0), [1, -1])
 
             #initialize alphas of the dirichlet
-            new_alphas = tf.matmul(actives_mean, self.w)
+            new_alphas = tf.maximum(tf.matmul(actives_mean, self.w), tf.constant(-1 * tf.reduce_max(self.alpha) + 1e-4, dtype=tf.float32))
 
-            assert new_alphas.shape[0] == 1, 'New alphas should be a single row'
-            assert new_alphas.shape[1] == self.n_route*self.n_position, 'New alphas should have a spot for each route/position combination'
+            assert new_alphas.get_shape().as_list()[0] == 1, 'New alphas should be a single row'
+            assert new_alphas.get_shape().as_list()[1] == self.n_route*self.n_position, 'New alphas should have a spot for each route/position combination'
 
             #draw thetas from dirichlet
             new_thetas = []
             for i in range(self.n_position):
                 #add prior alphas to new alphas and draw for each position
-                dirichlet = tfd.Dirichlet(concentration=tf.add(self.alpha, new_alphas[list(range(i*self.n_route, (i+1)*self.n_route))]))
-                new_thetas.append(dirichlet.sample(sample_shape=self.n_route))
+                dirichlet = tfd.Dirichlet(concentration=tf.add(self.alpha, new_alphas[0, i*self.n_route:(i+1)*self.n_route]))
+                new_thetas.append(dirichlet.sample())
 
             #reshape flattened thetas to fit into n_positions by n_routes shape
-            self.theta.assign(tf.reshape(tf.convert_to_tensor(new_thetas), self.theta.shape))
+            self.theta.assign(tf.reshape(tf.convert_to_tensor(new_thetas), tf.shape(self.theta)))
 
             #use updated theta to sample routes
-            route_samples = self.postpredup(num_samples=num_samples)
+            route_samples = self.postpredup(num_samples=num_samples_int)
 
-        ########UPDATE GRADIENT FUNCTION#####################
-        gradient = self.gradientup(route_samples)
+        out_samples = route_samples
+
+        assert out_samples.get_shape().as_list() == in_samples.get_shape().as_list(), 'Samples should have the same shape in CD_k_up'
+
+        gradient = tf.subtract(self.gradientup(in_samples), self.gradientup(out_samples))
+
+        assert gradient.get_shape().as_list() == self.w.get_shape().as_list(), 'Gradient should have the same shape as weight matrix'
 
         return gradient
 
     def CD_k_down(self, active_samples):
+        ##DO THIS TOMORROW TO UPDATE LIKE CD_K_UP##
+
+        in_samples = active_samples
 
         # given true active samples trade back and forth and produce new active samples at the end
-        num_samples = active_samples.shape[0]
+        num_samples = tf.shape(active_samples)[0]
 
         #see comments above, same but in different order
         for _ in range(self.k):
@@ -302,12 +315,15 @@ class RBM:
 
             new_alphas = tf.matmul(actives_mean, self.w)
 
+            assert tf.shape(new_alphas)[0] == 1, 'New alphas should be a single row'
+            assert tf.shape(new_alphas)[1] == self.n_route*self.n_position, 'New alphas should have a spot for each route/position combination'
+
             new_thetas = []
             for i in range(self.n_position):
                 dirichlet = tfd.Dirichlet(concentration=tf.add(self.alpha, new_alphas[list(range(i*self.n_route, (i+1)*self.n_route))]))
                 new_thetas.append(dirichlet.sample(sample_shape=self.n_route))
 
-            self.theta.assign(tf.reshape(tf.convert_to_tensor(new_thetas), self.theta.shape))
+            self.theta.assign(tf.reshape(tf.convert_to_tensor(new_thetas), tf.shape(self.theta)))
 
             route_samples = self.postpredup(num_samples=num_samples)
 
@@ -327,25 +343,38 @@ class RBM:
                 sigma_vec = tf.sqrt(
                     tf.divide(tf.multiply(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.square(self.sigma)),
                               tf.add(tf.multiply(num_samples, tf.square(self.sigma_not)), tf.square(self.sigma))))
+
+                assert tf.shape(mean_vec) == tf.shape(self.mu), 'Mean vector should have same shape as mu in normal-normal'
+                assert tf.shape(sigma_vec) == tf.shape(self.sigma), 'Scale vector should have same shape as sigma in normal-normal'
+
                 normal = tfd.MultivariateNormalDiag(loc=mean_vec, scale_diag=sigma_vec)
 
-                self.mu.assign(normal.sample(sample_shape=self.mu.shape))
+                self.mu.assign(normal.sample(sample_shape=tf.shape(self.mu)))
 
                 concentration = tf.add(self.nu, 0.5)
                 rate = tf.divide(tf.add(tf.multiply(2, self.nu),
                                         tf.square(tf.subtract(tf.matmul(self.w, tf.transpose(routes_mean)), self.mu))), 2)
 
+                assert tf.shape(concentration) == (), 'Alpha of inverse gamma should be a scalar'
+                assert tf.shape(rate) == tf.shape(self.sigma), 'Beta of inverse gamma should have as many elements as sigma'
+
                 sig_list = []
-                for i in range(self.sigma.shape[0]):
+                for i in range(tf.shape(self.sigma)[0]):
                     inv_gamma = tfd.InverseGamma(concentration=concentration, rate=rate[i])
                     sig_list.append(inv_gamma.sample())
                 self.sigma.assign(tf.convert_to_tensor(sig_list, dtype=tf.float32))
 
             active_samples = self.postpreddown(route_samples)
 
-            gradient = self.gradientdown(active_samples)
+        out_samples = active_samples
 
-            return gradient
+        assert tf.shape(out_samples) == tf.shape(in_samples), 'Samples should have the same shape in CD_k_down'
+
+        gradient = tf.subtract(self.gradientup(in_samples), self.gradientup(out_samples))
+
+        assert tf.shape(gradient) == tf.shape(self.w), 'Gradient should have the same shape as weight matrix'
+
+        return gradient
 
     def learn(self, samples):
         #get the gradient and update the weight matrix
@@ -369,8 +398,9 @@ class RBM:
         normal = tfd.MultivariateNormalDiag(loc=self.mu, scale_diag=self.sigma)
 
         likelihood_temp = 0
+        ##CHANGE THIS LIKE POSTPREDUP##
         for i in range(self.n_position):
-            multinomial = tfd.Multinomial(total_count=route_samples.shape[0], probs=self.theta[i, :])
+            multinomial = tfd.Multinomial(total_count=tf.shape(route_samples)[0], probs=self.theta[i, :])
             likelihood_temp += multinomial.prob(route_sums[list(range(i*self.n_route, (i+1)*self.n_route))])
 
         return [likelihood_temp, normal.prob(active_means)]
@@ -380,7 +410,22 @@ def train(train_data, epochs):
     # directories to save samples and logs
     logs_dir = './logs'
 
+if __name__ == "__main__":
+    data = Data()
 
+    simulated_data = data.simulate()
+
+    rbm = RBM(n_route=2, n_position=3, n_active=4)
+
+    routes = simulated_data['routes']
+    actives = simulated_data['actives']
+
+    route_samples = routes[np.random.randint(routes.shape[0], size=10), :]
+    active_samples = actives[np.random.randint(actives.shape[0], size=10), :]
+
+    likelihood = rbm.likelihoods(route_samples, active_samples)
+
+    print('hi')
 
 
 
